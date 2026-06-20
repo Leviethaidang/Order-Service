@@ -61,7 +61,7 @@ const PAYMENT_STATUSES = [
     'UNPAID'
 ];
 
-const SUPPORTED_PAYMENT_METHODS = ['MOMO', 'BANK'];
+const SUPPORTED_PAYMENT_METHODS = ['MOMO', 'BANK', 'COD'];
 
 // ================================
 // ERROR HELPER
@@ -385,7 +385,7 @@ async function resolvePaymentMethod(body, accessToken) {
     if (!SUPPORTED_PAYMENT_METHODS.includes(methodType)) {
         throw new ClientError(
             400,
-            'Checkout hiện chỉ hỗ trợ MoMo hoặc Bank. COD sẽ được xử lý riêng sau.'
+            'Checkout hiện chỉ hỗ trợ COD, MoMo hoặc Bank.'
         );
     }
 
@@ -551,7 +551,7 @@ async function createOrderInDatabase({
                 total_quantity,
                 total_amount
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_PAYMENT', 'PENDING', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `,
             [
                 userId,
@@ -562,6 +562,8 @@ async function createOrderInDatabase({
                 paymentMethod.paymentMethodId,
                 paymentMethod.paymentMethodType,
                 paymentMethod.paymentMethodDisplayName,
+                paymentMethod.paymentMethodType === 'COD' ? 'CONFIRMED' : 'PENDING_PAYMENT',
+                paymentMethod.paymentMethodType === 'COD' ? 'UNPAID' : 'PENDING',
                 checkoutData.totalQuantity,
                 checkoutData.totalAmount
             ]
@@ -605,8 +607,8 @@ async function createOrderInDatabase({
             sourceType,
             ...receiverInfo,
             ...paymentMethod,
-            orderStatus: 'PENDING_PAYMENT',
-            paymentStatus: 'PENDING',
+            orderStatus: paymentMethod.paymentMethodType === 'COD' ? 'CONFIRMED' : 'PENDING_PAYMENT',
+            paymentStatus: paymentMethod.paymentMethodType === 'COD' ? 'UNPAID' : 'PENDING',
             totalQuantity: checkoutData.totalQuantity,
             totalAmount: checkoutData.totalAmount,
             items: checkoutData.items
@@ -752,36 +754,39 @@ app.post('/api/orders/checkout', authMiddleware, async (req, res) => {
             checkoutData
         });
 
-        let paymentRequest;
+        let paymentRequest = {
+            published: false,
+            reason: 'COD_SKIP_PAYMENT'
+        };
 
-        try {
-            paymentRequest = await publishPaymentRequested(order);
-        } catch (snsError) {
-            console.error('Lỗi publish PaymentRequested:', snsError);
+        if (order.paymentMethodType !== 'COD') {
+            try {
+                paymentRequest = await publishPaymentRequested(order);
+            } catch (snsError) {
+                console.error('Lỗi publish PaymentRequested:', snsError);
 
-            await dbPool.execute(
-                `
-                UPDATE orders
-                SET
-                    order_status = 'PAYMENT_FAILED',
-                    payment_status = 'FAILED',
-                    payment_error = ?
-                WHERE order_id = ?
-                `,
-                [snsError.message, order.orderId]
-            );
+                await dbPool.execute(
+                    `
+                    DELETE FROM orders
+                    WHERE order_id = ?
+                    AND user_id = ?
+                    `,
+                    [order.orderId, userId]
+                );
 
-            return res.status(500).json({
-                error: 'Đơn hàng đã được tạo nhưng không gửi được yêu cầu thanh toán!',
-                orderId: order.orderId,
-                detail: snsError.message
-            });
+                return res.status(500).json({
+                    error: 'Không gửi được yêu cầu thanh toán. Đơn hàng đã được hủy.',
+                    detail: snsError.message
+                });
+            }
         }
 
         const createdOrder = await getOrderWithItems(order.orderId, userId);
 
         return res.status(201).json({
-            message: 'Tạo đơn hàng thành công! Đơn hàng đang chờ thanh toán.',
+            message: order.paymentMethodType === 'COD'
+                ? 'Tạo đơn hàng COD thành công! Đơn hàng đã được xác nhận.'
+                : 'Tạo đơn hàng thành công! Đơn hàng đang chờ thanh toán.',
             order: createdOrder,
             paymentRequest
         });
