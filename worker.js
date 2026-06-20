@@ -103,7 +103,13 @@ async function applyPaymentResult(paymentResult) {
         const order = await getOrderForUpdate(connection, paymentResult.orderId);
 
         if (!order) {
-            throw new Error(`Không tìm thấy orderId=${paymentResult.orderId}`);
+            console.log(`[SKIP] Order ${paymentResult.orderId} không tồn tại. Có thể đã bị xóa trước đó.`);
+            await connection.commit();
+
+            return {
+                skipped: true,
+                reason: 'ORDER_NOT_FOUND'
+            };
         }
 
         if (paymentResult.userId && paymentResult.userId !== order.user_id) {
@@ -115,52 +121,58 @@ async function applyPaymentResult(paymentResult) {
         if (order.order_status === 'CANCELLED') {
             console.log(`[SKIP] Order ${paymentResult.orderId} đã CANCELLED, không update payment result.`);
             await connection.commit();
+
             return {
                 skipped: true,
                 reason: 'ORDER_CANCELLED'
             };
         }
 
+        if (paymentResult.paymentStatus === 'FAILED') {
+            console.log(`[DELETE] Payment FAILED. Deleting order ${paymentResult.orderId}.`);
+
+            await connection.execute(
+                `
+                DELETE FROM orders
+                WHERE order_id = ?
+                `,
+                [paymentResult.orderId]
+            );
+
+            await connection.commit();
+
+            return {
+                skipped: false,
+                deleted: true,
+                orderId: paymentResult.orderId,
+                paymentStatus: 'FAILED',
+                reason: paymentResult.paymentError
+            };
+        }
+
         if (order.payment_status === 'PAID' && order.payment_transaction_id) {
             console.log(`[SKIP] Order ${paymentResult.orderId} đã PAID trước đó.`);
             await connection.commit();
+
             return {
                 skipped: true,
                 reason: 'ALREADY_PAID'
             };
         }
 
-        if (order.payment_status === 'FAILED' && order.payment_transaction_id) {
-            console.log(`[SKIP] Order ${paymentResult.orderId} đã FAILED trước đó.`);
-            await connection.commit();
-            return {
-                skipped: true,
-                reason: 'ALREADY_FAILED'
-            };
-        }
-
-        const nextOrderStatus =
-            paymentResult.paymentStatus === 'PAID'
-                ? 'CONFIRMED'
-                : 'PAYMENT_FAILED';
-
         await connection.execute(
             `
             UPDATE orders
             SET
-                order_status = ?,
-                payment_status = ?,
+                order_status = 'CONFIRMED',
+                payment_status = 'PAID',
                 payment_transaction_id = ?,
-                payment_error = ?,
-                paid_at = CASE WHEN ? = 'PAID' THEN CURRENT_TIMESTAMP ELSE paid_at END
+                payment_error = NULL,
+                paid_at = CURRENT_TIMESTAMP
             WHERE order_id = ?
             `,
             [
-                nextOrderStatus,
-                paymentResult.paymentStatus,
                 paymentResult.paymentTransactionId,
-                paymentResult.paymentError,
-                paymentResult.paymentStatus,
                 paymentResult.orderId
             ]
         );
@@ -169,9 +181,10 @@ async function applyPaymentResult(paymentResult) {
 
         return {
             skipped: false,
+            deleted: false,
             orderId: paymentResult.orderId,
-            orderStatus: nextOrderStatus,
-            paymentStatus: paymentResult.paymentStatus
+            orderStatus: 'CONFIRMED',
+            paymentStatus: 'PAID'
         };
 
     } catch (error) {

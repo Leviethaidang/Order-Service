@@ -670,15 +670,6 @@ async function getOrderWithItems(orderId, userId = null) {
 // SNS HELPER
 // ================================
 async function publishPaymentRequested(order) {
-    const enableSns = process.env.ENABLE_SNS === 'true';
-
-    if (!enableSns) {
-        return {
-            published: false,
-            reason: 'SNS_DISABLED'
-        };
-    }
-
     const topicArn = process.env.PAYMENT_REQUESTED_TOPIC_ARN;
 
     if (!topicArn) {
@@ -771,19 +762,15 @@ app.post('/api/orders/checkout', authMiddleware, async (req, res) => {
 
             await dbPool.execute(
                 `
-                UPDATE orders
-                SET
-                    order_status = 'PAYMENT_FAILED',
-                    payment_status = 'FAILED',
-                    payment_error = ?
+                DELETE FROM orders
                 WHERE order_id = ?
+                AND user_id = ?
                 `,
-                [snsError.message, order.orderId]
+                [order.orderId, userId]
             );
 
             return res.status(500).json({
-                error: 'Đơn hàng đã được tạo nhưng không gửi được yêu cầu thanh toán!',
-                orderId: order.orderId,
+                error: 'Không gửi được yêu cầu thanh toán. Đơn hàng đã được hủy.',
                 detail: snsError.message
             });
         }
