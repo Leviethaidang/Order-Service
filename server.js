@@ -1011,7 +1011,18 @@ app.get('/api/orders/admin/orders', authMiddleware, adminMiddleware, async (req,
             `
             SELECT *
             FROM orders
-            ORDER BY created_at DESC
+            WHERE order_status <> 'PAYMENT_FAILED'
+            AND payment_status <> 'FAILED'
+            ORDER BY
+                CASE order_status
+                    WHEN 'CONFIRMED' THEN 1
+                    WHEN 'SHIPPING' THEN 2
+                    WHEN 'PENDING_PAYMENT' THEN 3
+                    WHEN 'COMPLETED' THEN 4
+                    WHEN 'CANCELLED' THEN 5
+                    ELSE 99
+                END ASC,
+                created_at ASC
             `
         );
 
