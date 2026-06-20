@@ -129,22 +129,33 @@ async function applyPaymentResult(paymentResult) {
         }
 
         if (paymentResult.paymentStatus === 'FAILED') {
-            console.log(`[DELETE] Payment FAILED. Deleting order ${paymentResult.orderId}.`);
+            console.log(`[FAILED] Payment FAILED. Marking order ${paymentResult.orderId} as PAYMENT_FAILED.`);
 
             await connection.execute(
                 `
-                DELETE FROM orders
+                UPDATE orders
+                SET
+                    order_status = 'PAYMENT_FAILED',
+                    payment_status = 'FAILED',
+                    payment_transaction_id = ?,
+                    payment_error = ?,
+                    paid_at = NULL
                 WHERE order_id = ?
                 `,
-                [paymentResult.orderId]
+                [
+                    paymentResult.paymentTransactionId,
+                    paymentResult.paymentError,
+                    paymentResult.orderId
+                ]
             );
 
             await connection.commit();
 
             return {
                 skipped: false,
-                deleted: true,
+                deleted: false,
                 orderId: paymentResult.orderId,
+                orderStatus: 'PAYMENT_FAILED',
                 paymentStatus: 'FAILED',
                 reason: paymentResult.paymentError
             };

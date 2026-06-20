@@ -720,7 +720,6 @@ async function publishPaymentRequested(order) {
         messageId: result.MessageId
     };
 }
-
 // =========================================================================
 // ROUTE 1: CHECKOUT - TẠO ĐƠN HÀNG
 // =========================================================================
@@ -762,15 +761,19 @@ app.post('/api/orders/checkout', authMiddleware, async (req, res) => {
 
             await dbPool.execute(
                 `
-                DELETE FROM orders
+                UPDATE orders
+                SET
+                    order_status = 'PAYMENT_FAILED',
+                    payment_status = 'FAILED',
+                    payment_error = ?
                 WHERE order_id = ?
-                AND user_id = ?
                 `,
-                [order.orderId, userId]
+                [snsError.message, order.orderId]
             );
 
             return res.status(500).json({
-                error: 'Không gửi được yêu cầu thanh toán. Đơn hàng đã được hủy.',
+                error: 'Đơn hàng đã được tạo nhưng không gửi được yêu cầu thanh toán!',
+                orderId: order.orderId,
                 detail: snsError.message
             });
         }
@@ -800,6 +803,8 @@ app.get('/api/orders/me', authMiddleware, async (req, res) => {
             SELECT *
             FROM orders
             WHERE user_id = ?
+            AND order_status <> 'PAYMENT_FAILED'
+            AND payment_status <> 'FAILED'
             ORDER BY created_at DESC
             `,
             [userId]
@@ -869,7 +874,7 @@ app.put('/api/orders/me/:orderId/cancel', authMiddleware, async (req, res) => {
             });
         }
 
-        if (['SHIPPING', 'COMPLETED', 'CANCELLED'].includes(order.orderStatus)) {
+        if (['COMPLETED', 'CANCELLED'].includes(order.orderStatus)) {
             return res.status(400).json({
                 error: `Không thể hủy đơn hàng ở trạng thái ${order.orderStatus}!`
             });
@@ -944,6 +949,56 @@ app.put('/api/orders/me/:orderId/received', authMiddleware, async (req, res) => 
 
     } catch (error) {
         return handleRouteError(res, error, 'Không thể xác nhận đã nhận hàng!');
+    }
+});
+
+// =========================================================================
+// ROUTE: USER DỌN DẸP ĐƠN THANH TOÁN THẤT BẠI
+// =========================================================================
+app.delete('/api/orders/me/:orderId/failed-cleanup', authMiddleware, async (req, res) => {
+    const userId = req.user.sub;
+    const orderId = parsePositiveInteger(req.params.orderId);
+
+    if (!orderId) {
+        return res.status(400).json({
+            error: 'orderId không hợp lệ!'
+        });
+    }
+
+    try {
+        const order = await getOrderWithItems(orderId, userId);
+
+        if (!order) {
+            return res.json({
+                message: 'Đơn hàng không còn tồn tại hoặc đã được dọn dẹp.'
+            });
+        }
+
+        if (order.orderStatus !== 'PAYMENT_FAILED' && order.paymentStatus !== 'FAILED') {
+            return res.status(400).json({
+                error: 'Chỉ có thể dọn dẹp đơn hàng thanh toán thất bại!'
+            });
+        }
+
+        await dbPool.execute(
+            `
+            DELETE FROM orders
+            WHERE order_id = ?
+              AND user_id = ?
+              AND (
+                    order_status = 'PAYMENT_FAILED'
+                 OR payment_status = 'FAILED'
+              )
+            `,
+            [orderId, userId]
+        );
+
+        return res.json({
+            message: 'Đã xóa đơn hàng thanh toán thất bại.'
+        });
+
+    } catch (error) {
+        return handleRouteError(res, error, 'Không thể xóa đơn hàng thanh toán thất bại!');
     }
 });
 
