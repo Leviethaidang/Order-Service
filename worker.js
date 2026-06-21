@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const AWS = require('aws-sdk');
 const mysql = require('mysql2/promise');
+const axios = require('axios');
 
 AWS.config.update({
     region: process.env.AWS_REGION || 'ap-southeast-1'
@@ -80,6 +81,7 @@ async function getOrderForUpdate(connection, orderId) {
         SELECT
             order_id,
             user_id,
+            source_type,
             order_status,
             payment_status,
             payment_transaction_id
@@ -189,13 +191,19 @@ async function applyPaymentResult(paymentResult) {
         );
 
         await connection.commit();
+        
+        let cartCleanup = null;
+        if (order.source_type === 'CART') {
+            cartCleanup = await clearCartForUser(order.user_id);
+        }
 
         return {
             skipped: false,
             deleted: false,
             orderId: paymentResult.orderId,
             orderStatus: 'CONFIRMED',
-            paymentStatus: 'PAID'
+            paymentStatus: 'PAID',
+            cartCleanup
         };
 
     } catch (error) {
@@ -274,6 +282,52 @@ async function pollMessages() {
             console.error('[POLL ERROR]', error.message);
             await sleep(3000);
         }
+    }
+}
+
+function getServiceUrl(envName) {
+    const value = process.env[envName];
+
+    if (!value) {
+        throw new Error(`Thiếu ${envName} trong file .env`);
+    }
+
+    return value.replace(/\/$/, '');
+}
+
+async function clearCartForUser(userId) {
+    try {
+        const baseUrl = getServiceUrl('CART_SERVICE_URL');
+
+        if (!process.env.INTERNAL_API_KEY) {
+            throw new Error('Thiếu INTERNAL_API_KEY trong Order Worker .env');
+        }
+
+        const response = await axios.delete(
+            `${baseUrl}/api/cart/internal/users/${encodeURIComponent(userId)}`,
+            {
+                headers: {
+                    'x-internal-api-key': process.env.INTERNAL_API_KEY
+                },
+                timeout: 5000
+            }
+        );
+
+        return {
+            cleared: true,
+            data: response.data
+        };
+
+    } catch (error) {
+        console.error(
+            '[CART CLEANUP ERROR]',
+            error.response?.data || error.message
+        );
+
+        return {
+            cleared: false,
+            error: error.response?.data?.error || error.message
+        };
     }
 }
 

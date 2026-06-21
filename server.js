@@ -782,13 +782,20 @@ app.post('/api/orders/checkout', authMiddleware, async (req, res) => {
         }
 
         const createdOrder = await getOrderWithItems(order.orderId, userId);
+        
+        let cartCleanup = null;
+
+        if (sourceType === 'CART' && order.paymentMethodType === 'COD') {
+            cartCleanup = await clearCartForUser(userId);
+        }
 
         return res.status(201).json({
             message: order.paymentMethodType === 'COD'
                 ? 'Tạo đơn hàng COD thành công! Đơn hàng đã được xác nhận.'
                 : 'Tạo đơn hàng thành công! Đơn hàng đang chờ thanh toán.',
             order: createdOrder,
-            paymentRequest
+            paymentRequest,
+            cartCleanup
         });
 
     } catch (error) {
@@ -1231,6 +1238,45 @@ app.put('/api/orders/internal/:orderId/payment-result', internalMiddleware, asyn
         return handleRouteError(res, error, 'Không thể cập nhật kết quả thanh toán!');
     }
 });
+
+// =========================================================================
+// INTERNAL HELPER: DỌN DẸP GIỎ HÀNG SAU KHI ORDER THÀNH CÔNG
+// =========================================================================
+async function clearCartForUser(userId) {
+    try {
+        const baseUrl = getServiceUrl('CART_SERVICE_URL');
+
+        if (!process.env.INTERNAL_API_KEY) {
+            throw new Error('Thiếu INTERNAL_API_KEY trong Order Service .env');
+        }
+
+        const response = await axios.delete(
+            `${baseUrl}/api/cart/internal/users/${encodeURIComponent(userId)}`,
+            {
+                headers: {
+                    'x-internal-api-key': process.env.INTERNAL_API_KEY
+                },
+                timeout: 5000
+            }
+        );
+
+        return {
+            cleared: true,
+            data: response.data
+        };
+
+    } catch (error) {
+        console.error(
+            'Lỗi dọn cart sau khi order thành công:',
+            error.response?.data || error.message
+        );
+
+        return {
+            cleared: false,
+            error: error.response?.data?.error || error.message
+        };
+    }
+}
 
 // ================================
 // START SERVER
