@@ -165,8 +165,14 @@ function formatOrderItemRow(row) {
         orderItemId: row.order_item_id,
         orderId: row.order_id,
         productId: row.product_id,
+        variantId: row.variant_id,
+
         productName: row.product_name,
         categoryName: row.category_name,
+        sizeName: row.size_name,
+        colorName: row.color_name,
+        colorCode: row.color_code,
+
         imageUrl: row.image_url,
         unitPrice: Number(row.unit_price),
         quantity: Number(row.quantity),
@@ -315,6 +321,16 @@ async function getProductById(productId) {
     }
 }
 
+function findVariant(product, variantId) {
+    if (!product || !Array.isArray(product.variants)) {
+        return null;
+    }
+
+    return product.variants.find(variant => {
+        return Number(variant.variant_id) === Number(variantId);
+    }) || null;
+}
+
 // ================================
 // CHECKOUT HELPERS
 // ================================
@@ -413,9 +429,18 @@ async function buildCartCheckoutItems(accessToken) {
             );
         }
 
+        if (cartItem.variantDeleted || !cartItem.variant) {
+            throw new ClientError(
+                400,
+                `Biến thể của sản phẩm ${cartItem.product?.productName || cartItem.productId} không còn tồn tại. Vui lòng xóa khỏi giỏ hàng trước khi checkout.`
+            );
+        }
+
         const product = cartItem.product;
+        const variant = cartItem.variant;
+
         const quantity = Number(cartItem.quantity);
-        const stockQuantity = Number(product.stockQuantity);
+        const stockQuantity = Number(variant.stockQuantity);
         const unitPrice = Number(product.price);
 
         if (!Number.isInteger(quantity) || quantity <= 0) {
@@ -423,13 +448,16 @@ async function buildCartCheckoutItems(accessToken) {
         }
 
         if (Number.isNaN(stockQuantity) || stockQuantity <= 0) {
-            throw new ClientError(400, `Sản phẩm ${product.productName} đã hết hàng!`);
+            throw new ClientError(
+                400,
+                `Biến thể ${product.productName} - ${variant.sizeName} / ${variant.colorName} đã hết hàng!`
+            );
         }
 
         if (quantity > stockQuantity) {
             throw new ClientError(
                 400,
-                `Sản phẩm ${product.productName} vượt quá tồn kho. Tồn kho hiện tại: ${stockQuantity}`
+                `Biến thể ${product.productName} - ${variant.sizeName} / ${variant.colorName} vượt quá tồn kho. Tồn kho hiện tại: ${stockQuantity}`
             );
         }
 
@@ -441,8 +469,14 @@ async function buildCartCheckoutItems(accessToken) {
 
         items.push({
             productId: product.productId,
+            variantId: variant.variantId,
+
             productName: product.productName,
             categoryName: product.categoryName || null,
+            sizeName: variant.sizeName || null,
+            colorName: variant.colorName || null,
+            colorCode: variant.colorCode || null,
+
             imageUrl: product.imageUrl || null,
             unitPrice: roundMoney(unitPrice),
             quantity,
@@ -464,10 +498,15 @@ async function buildCartCheckoutItems(accessToken) {
 
 async function buildBuyNowCheckoutItems(body) {
     const productId = parsePositiveInteger(body.productId);
+    const variantId = parsePositiveInteger(body.variantId);
     const quantity = parsePositiveInteger(body.quantity || 1);
 
     if (!productId) {
         throw new ClientError(400, 'productId không hợp lệ!');
+    }
+
+    if (!variantId) {
+        throw new ClientError(400, 'variantId không hợp lệ!');
     }
 
     if (!quantity) {
@@ -480,17 +519,27 @@ async function buildBuyNowCheckoutItems(body) {
         throw new ClientError(404, 'Sản phẩm không tồn tại!');
     }
 
-    const stockQuantity = Number(product.stock_quantity);
+    const variant = findVariant(product, variantId);
+
+    if (!variant) {
+        throw new ClientError(404, 'Biến thể sản phẩm không tồn tại!');
+    }
+
+    if (Number(variant.product_id) !== Number(product.product_id)) {
+        throw new ClientError(400, 'Biến thể không thuộc sản phẩm này!');
+    }
+
+    const stockQuantity = Number(variant.stock_quantity);
     const unitPrice = Number(product.price);
 
     if (Number.isNaN(stockQuantity) || stockQuantity <= 0) {
-        throw new ClientError(400, 'Sản phẩm đã hết hàng!');
+        throw new ClientError(400, 'Biến thể này đã hết hàng!');
     }
 
     if (quantity > stockQuantity) {
         throw new ClientError(
             400,
-            `Số lượng vượt quá tồn kho. Tồn kho hiện tại: ${stockQuantity}`
+            `Số lượng vượt quá tồn kho của biến thể. Tồn kho hiện tại: ${stockQuantity}`
         );
     }
 
@@ -503,8 +552,14 @@ async function buildBuyNowCheckoutItems(body) {
     const items = [
         {
             productId: product.product_id,
+            variantId: variant.variant_id,
+
             productName: product.product_name,
             categoryName: product.category_name || null,
+            sizeName: variant.size_name || null,
+            colorName: variant.color_name || null,
+            colorCode: variant.color_code || null,
+
             imageUrl: product.imageUrl || null,
             unitPrice: roundMoney(unitPrice),
             quantity,
@@ -577,20 +632,28 @@ async function createOrderInDatabase({
                 INSERT INTO order_items (
                     order_id,
                     product_id,
+                    variant_id,
                     product_name,
                     category_name,
+                    size_name,
+                    color_name,
+                    color_code,
                     image_url,
                     unit_price,
                     quantity,
                     subtotal
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 `,
                 [
                     orderId,
                     item.productId,
+                    item.variantId,
                     item.productName,
                     item.categoryName,
+                    item.sizeName,
+                    item.colorName,
+                    item.colorCode,
                     item.imageUrl,
                     item.unitPrice,
                     item.quantity,
