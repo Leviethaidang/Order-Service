@@ -521,26 +521,6 @@ async function buildCartCheckoutItems(accessToken) {
             );
         }
 
-        const product = cartItem.product;
-        const variant = cartItem.variant;
-
-        const quantity = Number(cartItem.quantity);
-        const stockQuantity = Number(
-            variant.quantityAvailable ?? variant.stockQuantity ?? 0
-        );
-        const unitPrice = Number(product.price);
-
-        if (!Number.isInteger(quantity) || quantity <= 0) {
-            throw new ClientError(400, `Số lượng sản phẩm ${product.productName} không hợp lệ!`);
-        }
-
-        if (Number.isNaN(stockQuantity) || stockQuantity <= 0) {
-            throw new ClientError(
-                400,
-                `Biến thể ${product.productName} - ${variant.sizeName} / ${variant.colorName} đã hết hàng!`
-            );
-        }
-
         if (cartItem.inventoryMissing) {
             throw new ClientError(
                 400,
@@ -548,10 +528,28 @@ async function buildCartCheckoutItems(accessToken) {
             );
         }
 
-        if (quantity > stockQuantity) {
+        const product = cartItem.product;
+        const variant = cartItem.variant;
+
+        const quantity = Number(cartItem.quantity);
+        const availableQuantity = Number(variant.quantityAvailable || 0);
+        const unitPrice = Number(product.price);
+
+        if (!Number.isInteger(quantity) || quantity <= 0) {
+            throw new ClientError(400, `Số lượng sản phẩm ${product.productName} không hợp lệ!`);
+        }
+
+        if (Number.isNaN(availableQuantity) || availableQuantity <= 0) {
             throw new ClientError(
                 400,
-                `Biến thể ${product.productName} - ${variant.sizeName} / ${variant.colorName} vượt quá tồn kho. Tồn kho hiện tại: ${stockQuantity}`
+                `Biến thể ${product.productName} - ${variant.sizeName} / ${variant.colorName} đã hết hàng!`
+            );
+        }
+
+        if (quantity > availableQuantity) {
+            throw new ClientError(
+                400,
+                `Biến thể ${product.productName} - ${variant.sizeName} / ${variant.colorName} vượt quá số lượng còn lại. Hiện tại còn: ${availableQuantity}`
             );
         }
 
@@ -579,6 +577,7 @@ async function buildCartCheckoutItems(accessToken) {
     }
 
     const totalQuantity = items.reduce((sum, item) => sum + item.quantity, 0);
+
     const totalAmount = roundMoney(
         items.reduce((sum, item) => sum + item.subtotal, 0)
     );
@@ -629,17 +628,17 @@ async function buildBuyNowCheckoutItems(body) {
         throw new ClientError(400, 'Biến thể này chưa có tồn kho hoặc đã ngừng bán!');
     }
 
-    const stockQuantity = Number(inventory.quantity_available || 0);
+    const availableQuantity = Number(inventory.quantity_available || 0);
     const unitPrice = Number(product.price);
 
-    if (stockQuantity <= 0) {
+    if (availableQuantity <= 0) {
         throw new ClientError(400, 'Biến thể này đã hết hàng!');
     }
 
-    if (quantity > stockQuantity) {
+    if (quantity > availableQuantity) {
         throw new ClientError(
             400,
-            `Số lượng vượt quá tồn kho của biến thể. Tồn kho hiện tại: ${stockQuantity}`
+            `Số lượng vượt quá số lượng còn lại của biến thể. Hiện tại còn: ${availableQuantity}`
         );
     }
 
