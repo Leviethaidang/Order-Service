@@ -331,6 +331,91 @@ function findVariant(product, variantId) {
     }) || null;
 }
 
+function buildInventoryItems(orderOrCheckoutData) {
+    const items = orderOrCheckoutData.items || [];
+
+    return items.map(item => ({
+        variantId: Number(item.variantId),
+        quantity: Number(item.quantity)
+    }));
+}
+
+async function callInventoryInternal(path, payload) {
+    const baseUrl = getServiceUrl('INVENTORY_SERVICE_URL');
+
+    if (!process.env.INTERNAL_API_KEY) {
+        throw new Error('Thiếu INTERNAL_API_KEY trong Order Service .env');
+    }
+
+    const response = await axios.post(
+        `${baseUrl}${path}`,
+        payload,
+        {
+            headers: {
+                'x-internal-api-key': process.env.INTERNAL_API_KEY
+            },
+            timeout: 7000
+        }
+    );
+
+    return response.data;
+}
+
+async function reserveInventoryForOrder(order) {
+    return callInventoryInternal('/api/inventory/internal/reserve', {
+        referenceType: 'ORDER',
+        referenceId: String(order.orderId),
+        items: buildInventoryItems(order)
+    });
+}
+
+async function releaseInventoryForOrder(order) {
+    return callInventoryInternal('/api/inventory/internal/release', {
+        referenceType: 'ORDER',
+        referenceId: String(order.orderId),
+        items: buildInventoryItems(order)
+    });
+}
+
+async function commitInventoryForOrder(order) {
+    return callInventoryInternal('/api/inventory/internal/commit', {
+        referenceType: 'ORDER',
+        referenceId: String(order.orderId),
+        items: buildInventoryItems(order)
+    });
+}
+
+async function markSoldInventoryForOrder(order) {
+    return callInventoryInternal('/api/inventory/internal/mark-sold', {
+        referenceType: 'ORDER',
+        referenceId: String(order.orderId),
+        items: buildInventoryItems(order)
+    });
+}
+
+async function getInventoryByVariantId(variantId) {
+    try {
+        const baseUrl = getServiceUrl('INVENTORY_SERVICE_URL');
+
+        const response = await axios.get(
+            `${baseUrl}/api/inventory/variants/${variantId}`,
+            {
+                timeout: 5000
+            }
+        );
+
+        return response.data.inventory;
+
+    } catch (error) {
+        if (error.response && error.response.status === 404) {
+            return null;
+        }
+
+        console.error('Lỗi gọi Inventory Service:', error.response?.data || error.message);
+        throw new Error('Không thể lấy tồn kho từ Inventory Service!');
+    }
+}
+
 // ================================
 // CHECKOUT HELPERS
 // ================================
@@ -440,7 +525,9 @@ async function buildCartCheckoutItems(accessToken) {
         const variant = cartItem.variant;
 
         const quantity = Number(cartItem.quantity);
-        const stockQuantity = Number(variant.stockQuantity);
+        const stockQuantity = Number(
+            variant.quantityAvailable ?? variant.stockQuantity ?? 0
+        );
         const unitPrice = Number(product.price);
 
         if (!Number.isInteger(quantity) || quantity <= 0) {
@@ -451,6 +538,13 @@ async function buildCartCheckoutItems(accessToken) {
             throw new ClientError(
                 400,
                 `Biến thể ${product.productName} - ${variant.sizeName} / ${variant.colorName} đã hết hàng!`
+            );
+        }
+
+        if (cartItem.inventoryMissing) {
+            throw new ClientError(
+                400,
+                `Biến thể của sản phẩm ${cartItem.product?.productName || cartItem.productId} chưa có tồn kho hoặc đã ngừng bán.`
             );
         }
 
@@ -529,10 +623,16 @@ async function buildBuyNowCheckoutItems(body) {
         throw new ClientError(400, 'Biến thể không thuộc sản phẩm này!');
     }
 
-    const stockQuantity = Number(variant.stock_quantity);
+    const inventory = await getInventoryByVariantId(variantId);
+
+    if (!inventory) {
+        throw new ClientError(400, 'Biến thể này chưa có tồn kho hoặc đã ngừng bán!');
+    }
+
+    const stockQuantity = Number(inventory.quantity_available || 0);
     const unitPrice = Number(product.price);
 
-    if (Number.isNaN(stockQuantity) || stockQuantity <= 0) {
+    if (stockQuantity <= 0) {
         throw new ClientError(400, 'Biến thể này đã hết hàng!');
     }
 
@@ -817,6 +917,29 @@ app.post('/api/orders/checkout', authMiddleware, async (req, res) => {
             checkoutData
         });
 
+        // Sau khi tạo order, giữ hàng trong Inventory.
+        try {
+            await reserveInventoryForOrder(order);
+        } catch (inventoryError) {
+            console.error(
+                'Lỗi reserve inventory khi checkout:',
+                inventoryError.response?.data || inventoryError.message
+            );
+
+            await dbPool.execute(
+                `
+                DELETE FROM orders
+                WHERE order_id = ?
+                  AND user_id = ?
+                `,
+                [order.orderId, userId]
+            );
+
+            return res.status(400).json({
+                error: inventoryError.response?.data?.error || 'Không thể giữ hàng trong kho. Đơn hàng đã được hủy.'
+            });
+        }
+
         let paymentRequest = {
             published: false,
             reason: 'COD_SKIP_PAYMENT'
@@ -828,11 +951,21 @@ app.post('/api/orders/checkout', authMiddleware, async (req, res) => {
             } catch (snsError) {
                 console.error('Lỗi publish PaymentRequested:', snsError);
 
+                // Nếu gửi yêu cầu thanh toán lỗi, phải release hàng đã reserve.
+                try {
+                    await releaseInventoryForOrder(order);
+                } catch (releaseError) {
+                    console.error(
+                        'Lỗi release inventory sau khi publish payment failed:',
+                        releaseError.response?.data || releaseError.message
+                    );
+                }
+
                 await dbPool.execute(
                     `
                     DELETE FROM orders
                     WHERE order_id = ?
-                    AND user_id = ?
+                      AND user_id = ?
                     `,
                     [order.orderId, userId]
                 );
@@ -845,7 +978,7 @@ app.post('/api/orders/checkout', authMiddleware, async (req, res) => {
         }
 
         const createdOrder = await getOrderWithItems(order.orderId, userId);
-        
+
         let cartCleanup = null;
 
         if (sourceType === 'CART' && order.paymentMethodType === 'COD') {
@@ -949,9 +1082,23 @@ app.put('/api/orders/me/:orderId/cancel', authMiddleware, async (req, res) => {
             });
         }
 
-        if (['COMPLETED', 'CANCELLED'].includes(order.orderStatus)) {
+        if (['SHIPPING', 'COMPLETED', 'CANCELLED'].includes(order.orderStatus)) {
             return res.status(400).json({
                 error: `Không thể hủy đơn hàng ở trạng thái ${order.orderStatus}!`
+            });
+        }
+
+        // Đơn chưa SHIPPING thì hàng vẫn đang reserved, nên hủy đơn phải release.
+        try {
+            await releaseInventoryForOrder(order);
+        } catch (inventoryError) {
+            console.error(
+                'Lỗi release inventory khi hủy đơn:',
+                inventoryError.response?.data || inventoryError.message
+            );
+
+            return res.status(500).json({
+                error: inventoryError.response?.data?.error || 'Không thể hoàn hàng trong kho nên chưa thể hủy đơn.'
             });
         }
 
@@ -1002,6 +1149,19 @@ app.put('/api/orders/me/:orderId/received', authMiddleware, async (req, res) => 
         if (order.orderStatus !== 'SHIPPING') {
             return res.status(400).json({
                 error: 'Chỉ đơn hàng đang giao mới có thể xác nhận đã nhận hàng!'
+            });
+        }
+
+        try {
+            await markSoldInventoryForOrder(order);
+        } catch (inventoryError) {
+            console.error(
+                'Lỗi mark-sold inventory khi user nhận hàng:',
+                inventoryError.response?.data || inventoryError.message
+            );
+
+            return res.status(500).json({
+                error: inventoryError.response?.data?.error || 'Không thể cập nhật số lượng đã bán trong kho.'
             });
         }
 
@@ -1191,6 +1351,61 @@ app.put('/api/orders/admin/orders/:orderId/status', authMiddleware, adminMiddlew
             });
         }
 
+        // Dev mode: admin được đổi trạng thái tự do.
+        // Nhưng inventory chỉ xử lý theo hướng tiến, không tự đảo ngược kho.
+        if (nextOrderStatus && nextOrderStatus !== currentOrder.orderStatus) {
+            if (nextOrderStatus === 'CANCELLED') {
+                if (!['SHIPPING', 'COMPLETED', 'CANCELLED'].includes(currentOrder.orderStatus)) {
+                    try {
+                        await releaseInventoryForOrder(currentOrder);
+                    } catch (inventoryError) {
+                        console.error(
+                            'Lỗi release inventory khi admin hủy đơn:',
+                            inventoryError.response?.data || inventoryError.message
+                        );
+
+                        return res.status(500).json({
+                            error: inventoryError.response?.data?.error || 'Không thể hoàn hàng trong kho nên chưa thể hủy đơn.'
+                        });
+                    }
+                }
+            }
+
+            if (nextOrderStatus === 'SHIPPING') {
+                if (currentOrder.orderStatus !== 'SHIPPING') {
+                    try {
+                        await commitInventoryForOrder(currentOrder);
+                    } catch (inventoryError) {
+                        console.error(
+                            'Lỗi commit inventory khi admin chuyển SHIPPING:',
+                            inventoryError.response?.data || inventoryError.message
+                        );
+
+                        return res.status(500).json({
+                            error: inventoryError.response?.data?.error || 'Không thể trừ tồn kho để chuyển đơn sang đang giao.'
+                        });
+                    }
+                }
+            }
+
+            if (nextOrderStatus === 'COMPLETED') {
+                if (currentOrder.orderStatus === 'SHIPPING') {
+                    try {
+                        await markSoldInventoryForOrder(currentOrder);
+                    } catch (inventoryError) {
+                        console.error(
+                            'Lỗi mark-sold inventory khi admin chuyển COMPLETED:',
+                            inventoryError.response?.data || inventoryError.message
+                        );
+
+                        return res.status(500).json({
+                            error: inventoryError.response?.data?.error || 'Không thể cập nhật số lượng đã bán trong kho.'
+                        });
+                    }
+                }
+            }
+        }
+
         const updateFields = [];
         const params = [];
 
@@ -1267,6 +1482,28 @@ app.put('/api/orders/internal/:orderId/payment-result', internalMiddleware, asyn
             return res.status(400).json({
                 error: 'Không thể cập nhật thanh toán cho đơn hàng đã hủy!'
             });
+        }
+
+        if (currentOrder.orderStatus === 'SHIPPING' || currentOrder.orderStatus === 'COMPLETED') {
+            return res.status(400).json({
+                error: `Không thể cập nhật thanh toán cho đơn hàng ở trạng thái ${currentOrder.orderStatus}!`
+            });
+        }
+
+        // Nếu thanh toán thất bại thì release hàng đã giữ.
+        if (paymentStatus === 'FAILED') {
+            try {
+                await releaseInventoryForOrder(currentOrder);
+            } catch (inventoryError) {
+                console.error(
+                    'Lỗi release inventory khi payment failed:',
+                    inventoryError.response?.data || inventoryError.message
+                );
+
+                return res.status(500).json({
+                    error: inventoryError.response?.data?.error || 'Không thể release inventory cho đơn thanh toán thất bại.'
+                });
+            }
         }
 
         await dbPool.execute(
