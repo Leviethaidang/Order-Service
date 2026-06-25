@@ -138,6 +138,7 @@ function formatOrderRow(row) {
 
         receiverName: row.receiver_name,
         receiverPhone: row.receiver_phone,
+        customerEmail: row.customer_email,
         shippingAddress: row.shipping_address,
 
         paymentMethodId: row.payment_method_id,
@@ -428,6 +429,9 @@ async function buildReceiverInfo(body, accessToken) {
     const receiverPhone =
         normalizeString(body.receiverPhone) || normalizeString(profile.phone_number);
 
+    const customerEmail =
+        normalizeString(body.customerEmail) || normalizeString(profile.email);
+
     const shippingAddress =
         normalizeString(body.shippingAddress) || normalizeString(profile.default_shipping_address);
 
@@ -439,6 +443,10 @@ async function buildReceiverInfo(body, accessToken) {
         throw new ClientError(400, 'Vui lòng nhập số điện thoại người nhận!');
     }
 
+    if (!customerEmail) {
+        throw new ClientError(400, 'Vui lòng nhập email nhận thông báo!');
+    }
+
     if (!shippingAddress) {
         throw new ClientError(400, 'Vui lòng nhập địa chỉ giao hàng!');
     }
@@ -446,6 +454,7 @@ async function buildReceiverInfo(body, accessToken) {
     return {
         receiverName,
         receiverPhone,
+        customerEmail,
         shippingAddress
     };
 }
@@ -693,6 +702,7 @@ async function createOrderInDatabase({
             `
             INSERT INTO orders (
                 user_id,
+                customer_email,
                 source_type,
                 receiver_name,
                 receiver_phone,
@@ -705,10 +715,11 @@ async function createOrderInDatabase({
                 total_quantity,
                 total_amount
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `,
             [
                 userId,
+                receiverInfo.customerEmail,
                 sourceType,
                 receiverInfo.receiverName,
                 receiverInfo.receiverPhone,
@@ -884,6 +895,123 @@ async function publishPaymentRequested(order) {
         messageId: result.MessageId
     };
 }
+
+async function publishNotificationRequested(eventType, order, extra = {}) {
+    const topicArn = process.env.NOTIFICATION_REQUESTED_TOPIC_ARN;
+
+    if (!topicArn) {
+        console.warn(`[NOTIFICATION SKIP] Thiếu NOTIFICATION_REQUESTED_TOPIC_ARN. Bỏ qua event ${eventType}.`);
+
+        return {
+            published: false,
+            reason: 'MISSING_NOTIFICATION_REQUESTED_TOPIC_ARN'
+        };
+    }
+
+    if (!order || !order.orderId) {
+        console.warn(`[NOTIFICATION SKIP] Order không hợp lệ cho event ${eventType}.`);
+
+        return {
+            published: false,
+            reason: 'INVALID_ORDER'
+        };
+    }
+
+    const message = {
+        eventType,
+        eventVersion: '1.0',
+        notificationType: 'ORDER',
+        order: {
+            orderId: order.orderId,
+            userId: order.userId,
+            customerEmail: order.customerEmail,
+
+            sourceType: order.sourceType,
+
+            receiverName: order.receiverName,
+            receiverPhone: order.receiverPhone,
+            shippingAddress: order.shippingAddress,
+
+            paymentMethodId: order.paymentMethodId,
+            paymentMethodType: order.paymentMethodType,
+            paymentMethodDisplayName: order.paymentMethodDisplayName,
+
+            orderStatus: order.orderStatus,
+            paymentStatus: order.paymentStatus,
+
+            totalQuantity: order.totalQuantity,
+            totalAmount: order.totalAmount,
+
+            paymentTransactionId: order.paymentTransactionId || null,
+            paymentError: order.paymentError || null,
+
+            createdAt: order.createdAt || null,
+            updatedAt: order.updatedAt || null,
+
+            items: Array.isArray(order.items)
+                ? order.items.map(item => ({
+                    orderItemId: item.orderItemId,
+                    productId: item.productId,
+                    variantId: item.variantId,
+
+                    productName: item.productName,
+                    categoryName: item.categoryName,
+
+                    sizeName: item.sizeName,
+                    colorName: item.colorName,
+                    colorCode: item.colorCode,
+
+                    imageUrl: item.imageUrl,
+                    unitPrice: item.unitPrice,
+                    quantity: item.quantity,
+                    subtotal: item.subtotal
+                }))
+                : []
+        },
+        extra,
+        requestedAt: new Date().toISOString()
+    };
+
+    try {
+        const result = await sns.publish({
+            TopicArn: topicArn,
+            Message: JSON.stringify(message),
+            MessageAttributes: {
+                eventType: {
+                    DataType: 'String',
+                    StringValue: eventType
+                },
+                notificationType: {
+                    DataType: 'String',
+                    StringValue: 'ORDER'
+                },
+                orderStatus: {
+                    DataType: 'String',
+                    StringValue: order.orderStatus || 'UNKNOWN'
+                },
+                paymentStatus: {
+                    DataType: 'String',
+                    StringValue: order.paymentStatus || 'UNKNOWN'
+                }
+            }
+        }).promise();
+
+        return {
+            published: true,
+            messageId: result.MessageId
+        };
+
+    } catch (error) {
+        console.error(`[NOTIFICATION ERROR] Không publish được ${eventType}:`, error.message);
+
+        return {
+            published: false,
+            reason: 'SNS_PUBLISH_FAILED',
+            error: error.message
+        };
+    }
+}
+
 // =========================================================================
 // ROUTE 1: CHECKOUT - TẠO ĐƠN HÀNG
 // =========================================================================
@@ -978,6 +1106,17 @@ app.post('/api/orders/checkout', authMiddleware, async (req, res) => {
 
         const createdOrder = await getOrderWithItems(order.orderId, userId);
 
+        let notificationRequest = {
+            published: false,
+            reason: 'NOT_REQUIRED_YET'
+        };
+
+        if (createdOrder.orderStatus === 'CONFIRMED') {
+            notificationRequest = await publishNotificationRequested('ORDER_CONFIRMED', createdOrder, {
+                reason: 'COD_ORDER_CREATED'
+            });
+        }
+
         let cartCleanup = null;
 
         if (sourceType === 'CART' && order.paymentMethodType === 'COD') {
@@ -990,6 +1129,7 @@ app.post('/api/orders/checkout', authMiddleware, async (req, res) => {
                 : 'Tạo đơn hàng thành công! Đơn hàng đang chờ thanh toán.',
             order: createdOrder,
             paymentRequest,
+            notificationRequest,
             cartCleanup
         });
 
@@ -1113,9 +1253,14 @@ app.put('/api/orders/me/:orderId/cancel', authMiddleware, async (req, res) => {
 
         const updatedOrder = await getOrderWithItems(orderId, userId);
 
+        const notificationRequest = await publishNotificationRequested('ORDER_CANCELLED', updatedOrder, {
+            cancelledBy: 'CUSTOMER'
+        });
+
         return res.json({
             message: 'Hủy đơn hàng thành công!',
-            order: updatedOrder
+            order: updatedOrder,
+            notificationRequest
         });
 
     } catch (error) {
@@ -1176,9 +1321,14 @@ app.put('/api/orders/me/:orderId/received', authMiddleware, async (req, res) => 
 
         const updatedOrder = await getOrderWithItems(orderId, userId);
 
+        const notificationRequest = await publishNotificationRequested('ORDER_COMPLETED', updatedOrder, {
+            completedBy: 'CUSTOMER'
+        });
+
         return res.json({
             message: 'Xác nhận đã nhận hàng thành công!',
-            order: updatedOrder
+            order: updatedOrder,
+            notificationRequest
         });
 
     } catch (error) {
@@ -1431,9 +1581,30 @@ app.put('/api/orders/admin/orders/:orderId/status', authMiddleware, adminMiddlew
 
         const updatedOrder = await getOrderWithItems(orderId);
 
+        if (nextOrderStatus && nextOrderStatus !== currentOrder.orderStatus) {
+            if (nextOrderStatus === 'SHIPPING') {
+                notificationRequest = await publishNotificationRequested('ORDER_SHIPPING', updatedOrder, {
+                    updatedBy: 'ADMIN'
+                });
+            }
+
+            if (nextOrderStatus === 'CANCELLED') {
+                notificationRequest = await publishNotificationRequested('ORDER_CANCELLED', updatedOrder, {
+                    cancelledBy: 'ADMIN'
+                });
+            }
+
+            if (nextOrderStatus === 'COMPLETED') {
+                notificationRequest = await publishNotificationRequested('ORDER_COMPLETED', updatedOrder, {
+                    completedBy: 'ADMIN'
+                });
+            }
+        }
+
         return res.json({
             message: 'Admin cập nhật trạng thái đơn hàng thành công!',
-            order: updatedOrder
+            order: updatedOrder,
+            notificationRequest
         });
 
     } catch (error) {

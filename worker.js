@@ -9,6 +9,7 @@ AWS.config.update({
 });
 
 const sqs = new AWS.SQS();
+const sns = new AWS.SNS();
 
 const dbPool = mysql.createPool({
     host: process.env.DB_HOST,
@@ -239,6 +240,28 @@ async function processMessage(message) {
 
         const result = await applyPaymentResult(paymentResult);
 
+        if (!result.skipped) {
+            const updatedOrder = await getOrderWithItemsForNotification(paymentResult.orderId);
+
+            if (updatedOrder) {
+                if (result.orderStatus === 'CONFIRMED' && result.paymentStatus === 'PAID') {
+                    const notificationRequest = await publishNotificationRequested('ORDER_CONFIRMED', updatedOrder, {
+                        reason: 'PAYMENT_PAID'
+                    });
+
+                    console.log('[NOTIFICATION] ORDER_CONFIRMED requested:', notificationRequest);
+                }
+
+                if (result.orderStatus === 'PAYMENT_FAILED' && result.paymentStatus === 'FAILED') {
+                    const notificationRequest = await publishNotificationRequested('ORDER_PAYMENT_FAILED', updatedOrder, {
+                        reason: result.reason || 'PAYMENT_FAILED'
+                    });
+
+                    console.log('[NOTIFICATION] ORDER_PAYMENT_FAILED requested:', notificationRequest);
+                }
+            }
+        }
+
         console.log('[DONE] Order updated from PaymentResult:', result);
 
         await deleteMessage(receiptHandle);
@@ -293,6 +316,157 @@ function getServiceUrl(envName) {
     }
 
     return value.replace(/\/$/, '');
+}
+
+function formatOrderRowForNotification(row) {
+    return {
+        orderId: row.order_id,
+        userId: row.user_id,
+        customerEmail: row.customer_email,
+        sourceType: row.source_type,
+
+        receiverName: row.receiver_name,
+        receiverPhone: row.receiver_phone,
+        shippingAddress: row.shipping_address,
+
+        paymentMethodId: row.payment_method_id,
+        paymentMethodType: row.payment_method_type,
+        paymentMethodDisplayName: row.payment_method_display_name,
+
+        orderStatus: row.order_status,
+        paymentStatus: row.payment_status,
+
+        totalQuantity: Number(row.total_quantity),
+        totalAmount: Number(row.total_amount),
+
+        paymentTransactionId: row.payment_transaction_id,
+        paymentError: row.payment_error,
+        paidAt: row.paid_at,
+
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+    };
+}
+
+function formatOrderItemRowForNotification(row) {
+    return {
+        orderItemId: row.order_item_id,
+        orderId: row.order_id,
+        productId: row.product_id,
+        variantId: row.variant_id,
+
+        productName: row.product_name,
+        categoryName: row.category_name,
+        sizeName: row.size_name,
+        colorName: row.color_name,
+        colorCode: row.color_code,
+
+        imageUrl: row.image_url,
+        unitPrice: Number(row.unit_price),
+        quantity: Number(row.quantity),
+        subtotal: Number(row.subtotal),
+        createdAt: row.created_at
+    };
+}
+
+async function getOrderWithItemsForNotification(orderId) {
+    const [orderRows] = await dbPool.execute(
+        `
+        SELECT *
+        FROM orders
+        WHERE order_id = ?
+        LIMIT 1
+        `,
+        [orderId]
+    );
+
+    if (orderRows.length === 0) {
+        return null;
+    }
+
+    const [itemRows] = await dbPool.execute(
+        `
+        SELECT *
+        FROM order_items
+        WHERE order_id = ?
+        ORDER BY order_item_id ASC
+        `,
+        [orderId]
+    );
+
+    return {
+        ...formatOrderRowForNotification(orderRows[0]),
+        items: itemRows.map(formatOrderItemRowForNotification)
+    };
+}
+async function publishNotificationRequested(eventType, order, extra = {}) {
+    const topicArn = process.env.NOTIFICATION_REQUESTED_TOPIC_ARN;
+
+    if (!topicArn) {
+        console.warn(`[NOTIFICATION SKIP] Thiếu NOTIFICATION_REQUESTED_TOPIC_ARN. Bỏ qua event ${eventType}.`);
+
+        return {
+            published: false,
+            reason: 'MISSING_NOTIFICATION_REQUESTED_TOPIC_ARN'
+        };
+    }
+
+    if (!order || !order.orderId) {
+        console.warn(`[NOTIFICATION SKIP] Order không hợp lệ cho event ${eventType}.`);
+
+        return {
+            published: false,
+            reason: 'INVALID_ORDER'
+        };
+    }
+
+    const message = {
+        eventType,
+        eventVersion: '1.0',
+        notificationType: 'ORDER',
+        order,
+        extra,
+        requestedAt: new Date().toISOString()
+    };
+
+    try {
+        const result = await sns.publish({
+            TopicArn: topicArn,
+            Message: JSON.stringify(message),
+            MessageAttributes: {
+                eventType: {
+                    DataType: 'String',
+                    StringValue: eventType
+                },
+                notificationType: {
+                    DataType: 'String',
+                    StringValue: 'ORDER'
+                },
+                orderStatus: {
+                    DataType: 'String',
+                    StringValue: order.orderStatus || 'UNKNOWN'
+                },
+                paymentStatus: {
+                    DataType: 'String',
+                    StringValue: order.paymentStatus || 'UNKNOWN'
+                }
+            }
+        }).promise();
+
+        return {
+            published: true,
+            messageId: result.MessageId
+        };
+
+    } catch (error) {
+        console.error(`[NOTIFICATION ERROR] Không publish được ${eventType}:`, error.message);
+
+        return {
+            published: false,
+            reason: 'SNS_PUBLISH_FAILED',
+            error: error.message
+        };
+    }
 }
 
 async function clearCartForUser(userId) {
