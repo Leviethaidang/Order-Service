@@ -5,7 +5,8 @@ CREATE TABLE IF NOT EXISTS orders (
     order_id BIGINT AUTO_INCREMENT PRIMARY KEY,
 
     user_id VARCHAR(128) NOT NULL,
-
+    customer_email VARCHAR(255) NULL,
+    
     -- CART hoặc BUY_NOW
     source_type VARCHAR(20) NOT NULL,
 
